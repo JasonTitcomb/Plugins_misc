@@ -135,15 +135,15 @@ static int32_t file_upload_read(void)
     if (c < 0)
         return -1; // nothing available
 
-    uint8_t b = (uint8_t)c;
-    upload.received++;
-
     // test for EOF character
     if (c == ASCII_EOT)
     {
         final_report();
         return -1;
     }
+
+    uint8_t b = (uint8_t)c;
+    upload.received++;
 
     upload.crc = crc32_update(upload.crc, b);
 
@@ -191,6 +191,12 @@ status_code_t file_upload_start(const char *fname, uint32_t size, bool echo)
 
     // capture stream
     my_stream = hal.stream;
+    int16_t c;
+    my_stream.reset_read_buffer(); // flush any pending input
+    // while ((c = my_stream.read()) >= 0)
+    // {
+    //     // discard leftover bytes
+    // }
     hal.stream.read = file_upload_read; // redirect reads to our upload handler
 
     state_backup = grbl.on_state_change;
