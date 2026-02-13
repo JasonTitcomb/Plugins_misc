@@ -193,10 +193,6 @@ status_code_t file_upload_start(const char *fname, uint32_t size, bool echo)
     my_stream = hal.stream;
     int16_t c;
     my_stream.reset_read_buffer(); // flush any pending input
-    // while ((c = my_stream.read()) >= 0)
-    // {
-    //     // discard leftover bytes
-    // }
     hal.stream.read = file_upload_read; // redirect reads to our upload handler
 
     state_backup = grbl.on_state_change;
