@@ -28,24 +28,33 @@
 #include "grbl/nuts_bolts.h"
 #include "sdcard/fs_fatfs.h"
 
+#define CHUNK_SIZE 256
+#define TIMEOUT_MS 2000
 static on_report_options_ptr on_report_options;
-io_stream_t my_stream;
-static on_state_change_ptr state_backup;
 
-// forward declaration
-static int32_t file_upload_read(void);
+// --- globals ---
+static io_stream_t src_stream;              // the stream that issued the $F> command
+static stream_read_ptr read_backup;         // original hal.stream.read
+static on_execute_realtime_ptr rt_backup;   // original realtime hook
 
-typedef struct
-{
-    vfs_file_t *file;       // target SD file
-    const char *filename;   // for reporting
-    uint32_t expected_size; // total bytes expected
-    uint32_t received;      // bytes received so far
-    uint32_t crc;           // optional CRC32
-    bool active;            // whether an upload is in progress
-    bool echo;              // whether to echo back received bytes for progress feedback
-} upload_t;
-static upload_t upload;
+static struct {
+    vfs_file_t *file;
+    const char *filename;
+    uint32_t expected;
+    uint32_t received;
+    uint32_t crc32;
+    bool active;
+
+    uint16_t chunk_size;     // e.g. 256
+    uint8_t  seq;           // chunk buffer sequence number, starts at 0
+
+    uint8_t  buf[CHUNK_SIZE];// set to chunk_size
+    uint16_t fill;          // number of bytes currently in buf
+
+    uint32_t last_rx_ticks;  // for timeout check
+    uint32_t timeout_ticks;  // computed from ms
+} up;
+
 
 // --- optional CRC32 helper ---
 static uint32_t crc32_update(uint32_t crc, uint8_t data)
@@ -56,57 +65,104 @@ static uint32_t crc32_update(uint32_t crc, uint8_t data)
     return crc;
 }
 
-static void report_msg_char(char c)
+static int32_t upload_read_stub (void)
 {
-    if (my_stream.write_char)
-        my_stream.write_char(c);
+    return -1; // parser sees "no input"
 }
 
-static void report_msg(const char *msg, message_type_t type)
+static void upload_stop (const char *msg)
 {
-    // Forward messages to the original stream
-    if (my_stream.write)
-    {
-        my_stream.write("[MSG:");
-        my_stream.write(msg);
-        my_stream.write("]" ASCII_EOL);
+    // restore parser read first (critical)
+    hal.stream.read = read_backup;
+
+    // restore realtime hook
+    grbl.on_execute_realtime = rt_backup;
+
+    // close file last
+    if(up.file) {
+        vfs_close(up.file);
+        up.file = NULL;
+    }
+
+    up.active = false;
+
+    if(msg) {
+        src_stream.write("[MSG:");
+        src_stream.write(msg);
+        src_stream.write("]" ASCII_EOL);
+    }
+}
+static void upload_pump (sys_state_t state)
+{
+    // chain original realtime processing
+    if(rt_backup) rt_backup(state);
+
+    if(!up.active)
+        return;
+
+    // ---- timeout check ----
+    uint32_t now = hal.get_elapsed_ticks();
+    if((now - up.last_rx_ticks) > up.timeout_ticks) {
+        upload_stop("FUP TIMEOUT");
+        return;
+    }
+
+    // ---- drain incoming bytes ----
+    while(up.received < up.expected) {
+
+        int16_t c = src_stream.read();  // read from the ORIGINAL stream (UART)
+        if(c < 0)
+            break; // no more bytes right now
+
+        up.last_rx_ticks = now; // update activity
+
+        uint8_t b = (uint8_t)c;
+
+        // buffer
+        up.buf[up.fill++] = b;
+        up.received++;
+        up.crc32 = crc32_update(up.crc32, b);
+
+        // write chunk when full or at end
+        if(up.fill == up.chunk_size || up.received == up.expected) {
+
+            size_t want = up.fill;
+            size_t wrote = vfs_write(up.buf, want, 1, up.file);
+            if(wrote != want) {
+                upload_stop("FUP SD WRITE ERROR");
+                return;
+            }
+
+            // ACK this chunk
+            char ack[48];
+            snprintf(ack, sizeof(ack), "ACK,%u,%u", (unsigned)up.seq, (unsigned)want);
+            src_stream.write(ack);
+            src_stream.write(ASCII_EOL);
+
+            up.seq++;
+            up.fill = 0;
+        }
+    }
+
+    // ---- done ----
+    if(up.received == up.expected) {
+        char done[96];
+        snprintf(done, sizeof(done),
+                 "FUP DONE bytes=%lu crc32=%08lX",
+                 (unsigned long)up.received,
+                 (unsigned long)(up.crc32 ^ 0xFFFFFFFFUL));
+
+        // Tell host, then stop (restores hooks, closes file)
+        src_stream.write("[MSG:");
+        src_stream.write(done);
+        src_stream.write("]" ASCII_EOL);
+        src_stream.write("ok" ASCII_EOL);
+
+        upload_stop(NULL);
+        return;
     }
 }
 
-static void upload_finish(void)
-{
-    // restore the stream handlers to their original state
-    hal.stream = my_stream;
-    grbl.on_state_change = state_backup;
-    upload.active = false;
-    if (upload.file)
-        vfs_close(upload.file);
-    upload.file = NULL;
-    upload.filename = NULL;
-    upload.expected_size = 0;
-    upload.received = 0;
-    upload.crc = 0;
-}
-
-static void on_state_change(sys_state_t state)
-{
-    if (upload.active && (state == STATE_IDLE || state == STATE_ALARM))
-    {
-        upload_finish();
-    }
-    // forward to original handler
-    if (state_backup)
-        state_backup(state);
-}
-
-static void final_report(void)
-{
-    char uploadmsg[64];
-    snprintf(uploadmsg, sizeof(uploadmsg), "File: %s, Bytes: %lu, CRC32: %08lX", upload.filename, upload.received, upload.crc ^ 0xFFFFFFFFUL);
-    report_msg(uploadmsg, Message_Info);
-    my_stream.write("ok" ASCII_EOL);
-    upload_finish();
-}
 
 static char *ltrim(char *s)
 {
@@ -125,87 +181,52 @@ static void rtrim(char *s)
     }
 }
 
-// --- called by hal.stream.read during upload ---
-static int32_t file_upload_read(void)
+
+status_code_t file_upload_start (const char *fname, uint32_t size)
 {
-    if (!upload.active)
-        return -1;
+    if(up.active)
+        return Status_InvalidStatement;
 
-    int16_t c = my_stream.read();
-    if (c < 0)
-        return -1; // nothing available
-
-    // test for EOF character
-    if (c == ASCII_EOT)
-    {
-        final_report();
-        return -1;
-    }
-
-    uint8_t b = (uint8_t)c;
-    upload.received++;
-
-    upload.crc = crc32_update(upload.crc, b);
-
-    // write to SD via VFS
-    size_t written = vfs_write(&b, 1, 1, upload.file);
-    if (written != 1)
-    {
-        // handle SD write error: abort upload
-        report_msg("Upload failed: SD write error", Message_Error);
-        upload_finish();
-        return -1;
-    }
-
-    if (upload.echo)
-    {
-        // echo back received byte for progress feedback
-        report_msg_char(b);
-    }
-
-    // finish condition
-    if (upload.received >= upload.expected_size)
-    {
-        final_report();
-        upload_finish();
-    }
-    return -1; // do not feed parser
-}
-
-// --- called by $FUP command to start upload ---
-status_code_t file_upload_start(const char *fname, uint32_t size, bool echo)
-{
-    if (upload.active)
-        return Status_InvalidStatement; // already uploading
-
-    upload.file = vfs_open(fname, "w");
-    if (!upload.file)
+    // Must be mounted already if your VFS needs it (see note below)
+    up.file = vfs_open(fname, "w");
+    if(!up.file)
         return Status_FileOpenFailed;
 
-    upload.filename = fname;
-    upload.expected_size = size;
-    upload.received = 0;
-    upload.crc = 0xFFFFFFFFUL;
-    upload.active = true;
-    upload.echo = echo;
+    // capture the stream that issued the command (UART stream)
+    src_stream = hal.stream;
 
-    // capture stream
-    my_stream = hal.stream;
-    int16_t c;
-    my_stream.reset_read_buffer(); // flush any pending input
-    hal.stream.read = file_upload_read; // redirect reads to our upload handler
+    up.filename = fname;
+    up.expected = size;
+    up.received = 0;
+    up.crc32 = 0xFFFFFFFFUL;
+    up.active = true;
 
-    state_backup = grbl.on_state_change;
-    grbl.on_state_change = on_state_change;
+    up.chunk_size = CHUNK_SIZE;
+    up.seq = 0;
+    up.fill = 0;
 
-    report_msg("Upload ready", Message_Info);
+    // timeout setup
+    up.last_rx_ticks = hal.get_elapsed_ticks();
+
+     up.timeout_ticks = TIMEOUT_MS; // "about 2 seconds"
+
+    // stop parser from consuming binary
+    read_backup = hal.stream.read;
+    hal.stream.read = upload_read_stub;
+
+    // install realtime pump
+    rt_backup = grbl.on_execute_realtime;
+    grbl.on_execute_realtime = upload_pump;
+
+    // Ready message
+    src_stream.write("[MSG:FUP RDY]" ASCII_EOL);
+
     return Status_OK;
 }
 
+
 static status_code_t sd_command_upload_start(sys_state_t state, char *args)
 {
-    bool should_echo = false;
-
     if (state != STATE_IDLE)
         return Status_SystemGClock;
 
@@ -222,26 +243,8 @@ static status_code_t sd_command_upload_start(sys_state_t state, char *args)
     char *filename = ltrim(start);
     rtrim(filename);
 
-    char *rest = ltrim(comma + 1);
-    char *comma2 = strchr(rest, ',');
-
-    char *size_str;
-    char *echo_str = NULL;
-
-    if (comma2)
-    {
-        *comma2 = '\0';
-        size_str = ltrim(rest);
-        rtrim(size_str);
-
-        echo_str = ltrim(comma2 + 1);
-        rtrim(echo_str);
-    }
-    else
-    {
-        size_str = ltrim(rest);
-        rtrim(size_str);
-    }
+    char *size_str = ltrim(comma + 1);
+    rtrim(size_str);
 
     if (*filename == '\0' || *size_str == '\0')
         return Status_InvalidStatement;
@@ -251,15 +254,7 @@ static status_code_t sd_command_upload_start(sys_state_t state, char *args)
     if (*endptr != '\0' || size > UINT32_MAX)
         return Status_InvalidStatement;
 
-    if (echo_str)
-    {
-        if (strcmp(echo_str, "echo") == 0)
-            should_echo = true;
-        else
-            return Status_InvalidStatement; // reject unknown third argument
-    }
-
-    return file_upload_start(filename, (uint32_t)size, should_echo);
+    return file_upload_start(filename, (uint32_t)size);
 }
 
 static void onReportOptions(bool newopt)
@@ -275,7 +270,7 @@ static void onReportOptions(bool newopt)
 void sdcard_upload_init(void)
 {
     PROGMEM static const sys_command_t sdcard_command_list[] = {
-        {"F>", sd_command_upload_start, {}, {.str = "upload to SD card. $F>=<filename>,<size>,[echo]"}},
+        {"F>", sd_command_upload_start, {}, {.str = "upload to SD card. $F>=<filename>,<size>"}},
     };
 
     static sys_commands_t sdcard_commands = {
