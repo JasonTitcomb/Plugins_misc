@@ -31,7 +31,7 @@ $F>=<filename>[,<size>]
 
 - `<filename>`: The name of the file to create on the SD card.
 - `<size>` (optional): The total size of the file in bytes. 
-If omitted, the upload will end when a `%` character is received after recieving at least 10 characters so the possibly.
+If omitted, the upload will end when a `%` character is received after recieving at least 10 characters.
 
 **Examples:**
 
