@@ -1,4 +1,38 @@
 ## Assorted small plugins
+[SD Card Upload Plugin]
+
+This plugin enables uploading files directly to the SD card attached to the Teensy 4-based grblHAL controller. It is designed to facilitate easy transfer of G-code and other files from a host computer to the SD card for CNC operations.
+
+### Features
+- Allows file uploads to the SD card via serial or USB interface
+- Integrates with grblHAL command set for seamless operation
+- Supports standard G-code file formats
+- Handles file management (create, overwrite, delete) on the SD card
+
+### Usage
+1. Ensure the SD card is properly connected to the Teensy 4 board.
+2. Use the appropriate grblHAL commands or host software to initiate file upload.
+3. Uploaded files will be stored on the SD card and can be accessed by the CNC controller.
+
+### Requirements
+- Teensy 4 microcontroller
+- grblHAL firmware
+- SD card module connected to the board
+
+### Installation
+1. Copy `sdcard_upload.c` to the `src/plugins/` directory of your grblHAL project.
+2. Rebuild the firmware using PlatformIO or your preferred build system.
+3. Flash the updated firmware to your Teensy 4 board.
+
+### Configuration
+- No special configuration is required. The plugin auto-detects the SD card and integrates with grblHAL.
+- For advanced settings, refer to the source code comments.
+
+### License
+This plugin is released under the same license as grblHAL. See the COPYING file for details.
+
+### Support
+For issues or feature requests, please open an issue in the main grblHAL repository or contact the project maintainers.
 
 ### Probe relay(s)
 
